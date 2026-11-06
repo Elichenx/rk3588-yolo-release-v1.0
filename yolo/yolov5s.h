@@ -61,6 +61,16 @@ public:
     // 推理：接收 V4L2 DMABUF fd（NV12，img_width×img_height）
     // RGA 将其转换+缩放为 RGB888（model_width×model_height）后送 NPU
     int inference_image(int dmabuf_fd, detect_result_group_t &result_group);
+
+    // 数据集测试：直接吃 OpenCV 读出的 BGR。按该图自己的宽高做 letterbox，不依赖摄像头 fd。
+    // stride 为 0 时按紧密排列（bgr_w * 3）处理。
+    int inference_bgr(const uint8_t *bgr, int bgr_w, int bgr_h, int stride,
+                      detect_result_group_t &result_group);
+
+private:
+    // 三个 INT8 输出头反量化 + NMS，坐标映射回调用方给定的 letterbox 参数
+    int decode_outputs(float scale_w, float scale_h, int pad_l, int pad_t,
+                       detect_result_group_t &result_group);
 };
 
 #endif

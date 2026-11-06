@@ -45,6 +45,10 @@ inline std::atomic<bool> g_watchdog_stop{false};
 // 全局 NPU 指针（main 中构造 ThreadPoll 后立即赋值）
 inline ThreadPoll* g_npu_pool_ptr = nullptr;
 
+// RK3576 NPU 是 2 核。不要按 RK3588 的 3 核去绑 CORE_2，驱动会拒绝。
+inline constexpr int kNpuCoreNum = 2;
+inline const char* kModelPath = "../model/yolov5s.rknn";
+
 // 摄像头设备路径（与 main 中 init 参数一致）
 inline const char*  g_cam_dev     = "/dev/video-camera0";
 inline int          g_cam_width   = 1920;
@@ -145,7 +149,7 @@ inline void watchdogThreadFunc(V4L2Camera& camera) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
                 try {
-                    g_npu_pool_ptr = new ThreadPoll("../model/best.rknn", 3,
+                    g_npu_pool_ptr = new ThreadPoll(kModelPath, kNpuCoreNum,
                                                     g_cam_width, g_cam_height);
                     npu_retry_count = 0;
                     watchdog_log("NPU recovered successfully (new ThreadPoll created).");

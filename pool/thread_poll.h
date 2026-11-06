@@ -33,6 +33,9 @@ public:
     // 提交异步推理任务（新的正确用法），返回 future 来获取结果
     //std::future<ProcessResult> submit_task_async(int index, cv::Mat img);
     std::future<ProcessResult> submit_task_async(int index, int dmabuf_fd);   //改成传入v4l2的fd
+
+    // 数据集图片：BGR，线程池内部会 clone，调用方可以立刻复用原图
+    std::future<ProcessResult> submit_bgr_async(int index, const cv::Mat& bgr);
 private:
     // 工作线程函数：不断从 tasks 队列里取 std::packaged_task 并执行
     void worker(int id);

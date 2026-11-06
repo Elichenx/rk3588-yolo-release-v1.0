@@ -1,0 +1,53 @@
+{
+    "env": {
+        "projectIncludePath": [
+            "${workspaceFolder}/camera",
+            "${workspaceFolder}/mpp",
+            "${workspaceFolder}/yolo",
+            "${workspaceFolder}/pool",
+            "${workspaceFolder}/streamer",
+            "${workspaceFolder}/tracker",
+            "${workspaceFolder}/bench",
+            "${workspaceFolder}/3rdparty/librknn_api/include",
+            "${workspaceFolder}/3rdparty/rga/RK3588/include"
+        ]
+    },
+    "configurations": [
+        {
+            "name": "Win32",
+            "compilerPath": "g++.exe",
+            "intelliSenseMode": "windows-gcc-x64",
+            "includePath": ["${workspaceFolder}", "${projectIncludePath}"],
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "browse": {
+                "path": ["${workspaceFolder}/*", "${projectIncludePath}"],
+                "limitSymbolsToIncludedHeaders": false
+            }
+        },
+        {
+            "name": "Linux",
+            "compilerPath": "/usr/bin/g++",
+            "intelliSenseMode": "${default}",
+            "includePath": [
+                "${workspaceFolder}",
+                "${projectIncludePath}",
+                "/usr/include/opencv4",
+                "/usr/local/include/opencv4"
+            ],
+            "compileCommands": ["${workspaceFolder}/build/compile_commands.json"],
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/*",
+                    "${projectIncludePath}",
+                    "/usr/include/opencv4",
+                    "/usr/local/include/opencv4"
+                ],
+                "limitSymbolsToIncludedHeaders": false
+            }
+        }
+    ],
+    "version": 4
+}

@@ -2,12 +2,17 @@
 #include "post_process.h"
 #include "bench/perf_timer.h"
 
+#include <opencv2/imgproc.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <cstring>
 #include <cstdio>
+
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 
 // 打印 tensor 属性（调试用）
 static void print_tensor_attr(rknn_tensor_attr *attr)
@@ -70,18 +75,15 @@ Yolov5s::Yolov5s(const char *model_path, int npu_index, int img_w, int img_h)
     }
     printf("Yolov5s[%d] init OK\n", npu_index);
 
-    // 绑定 NPU core（三核轮转，充分利用 RK3588 三个 NPU 核心）
+    // RK3576 NPU 只有 2 个核。绑 RKNN_NPU_CORE_2 会被驱动拒绝。
     rknn_core_mask core_mask;
-    switch (npu_index % 3)
+    switch (npu_index % 2)
     {
     case 0:
         core_mask = RKNN_NPU_CORE_0;
         break;
-    case 1:
-        core_mask = RKNN_NPU_CORE_1;
-        break;
     default:
-        core_mask = RKNN_NPU_CORE_2;
+        core_mask = RKNN_NPU_CORE_1;
         break;
     }
 
@@ -319,43 +321,118 @@ int Yolov5s::inference_image(int dmabuf_fd, detect_result_group_t &result_group)
     } // NPU_inference scope
 
     // ---------- 4. 后处理 ----------
+    return decode_outputs(scale, scale, pad_left, pad_top, result_group);
+}
+
+int Yolov5s::decode_outputs(float scale_w, float scale_h, int pad_l, int pad_t,
+                            detect_result_group_t &result_group)
+{
+    PERF_SCOPE("Post_process");
+    if ((int)output_mems_.size() < 3 || num_tensors.n_output < 3)
     {
-        PERF_SCOPE("Post_process");
-        // 【新增神仙逻辑】：根据 Tensor 内存大小，动态识别 80x80, 40x40, 20x20 的输出节点
-        struct OutputNode {
-            int8_t* ptr;
-            int32_t zp;
-            float scale;
-            int size;
-        };
-        std::vector<OutputNode> nodes;
-        for (int i = 0; i < (int)num_tensors.n_output; i++) {
-            nodes.push_back({
-                (int8_t *)output_mems_[i]->virt_addr,
-                output_attrs[i].zp,
-                output_attrs[i].scale,
-                (int)output_attrs[i].size
-            });
-        }
-        
-        // 按 size 从大到小排序 (保证顺序必定是：80x80, 40x40, 20x20)
-        std::sort(nodes.begin(), nodes.end(), [](const OutputNode& a, const OutputNode& b) {
-            return a.size > b.size;
-        });
-
-        std::vector<int32_t> qnt_zps = {nodes[0].zp, nodes[1].zp, nodes[2].zp};
-        std::vector<float> qnt_scales = {nodes[0].scale, nodes[1].scale, nodes[2].scale};
-
-        // 传入经过严格排序后的指针
-        post_process(
-            nodes[0].ptr, nodes[1].ptr, nodes[2].ptr,
-            model_height, model_width,
-            BOX_THRESHOLD, NMS_THRESHOLD,
-            scale, scale,
-            pad_left, pad_top,
-            qnt_zps, qnt_scales,
-            result_group);
+        printf("[yolo] expect 3 outputs, got %u\n", num_tensors.n_output);
+        return -1;
     }
 
+    // 按 Tensor 字节数从大到小排，对应 80x80、40x40、20x20
+    struct OutputNode {
+        int8_t* ptr;
+        int32_t zp;
+        float scale;
+        int size;
+    };
+    std::vector<OutputNode> nodes;
+    for (int i = 0; i < (int)num_tensors.n_output; i++) {
+        if (!output_mems_[i]) {
+            printf("[yolo] output mem[%d] is null\n", i);
+            return -1;
+        }
+        nodes.push_back({
+            (int8_t *)output_mems_[i]->virt_addr,
+            output_attrs[i].zp,
+            output_attrs[i].scale,
+            (int)output_attrs[i].size
+        });
+    }
+    std::sort(nodes.begin(), nodes.end(), [](const OutputNode& a, const OutputNode& b) {
+        return a.size > b.size;
+    });
+
+    std::vector<int32_t> qnt_zps = {nodes[0].zp, nodes[1].zp, nodes[2].zp};
+    std::vector<float> qnt_scales = {nodes[0].scale, nodes[1].scale, nodes[2].scale};
+    post_process(
+        nodes[0].ptr, nodes[1].ptr, nodes[2].ptr,
+        model_height, model_width,
+        BOX_THRESHOLD, NMS_THRESHOLD,
+        scale_w, scale_h,
+        pad_l, pad_t,
+        qnt_zps, qnt_scales,
+        result_group);
     return 0;
+}
+
+int Yolov5s::inference_bgr(const uint8_t *bgr, int bgr_w, int bgr_h, int stride,
+                           detect_result_group_t &result_group)
+{
+    if (!input_mem_ || !input_mem_->virt_addr || output_mems_.empty() || !bgr || bgr_w <= 0 || bgr_h <= 0
+        || model_width <= 0 || model_height <= 0)
+    {
+        printf("[yolo] inference_bgr: model IO not ready\n");
+        return -1;
+    }
+    if (stride <= 0)
+        stride = bgr_w * 3;
+
+    // 与摄像头路径相同的 letterbox：等比缩放、4 字节对齐、灰色 114 补边
+    const float lb_scale = std::min((float)model_width / bgr_w, (float)model_height / bgr_h);
+    int rz_w = std::max(4, ((int)(bgr_w * lb_scale) / 4) * 4);
+    int rz_h = std::max(4, ((int)(bgr_h * lb_scale) / 4) * 4);
+    if (rz_w > model_width) rz_w = model_width & ~3;
+    if (rz_h > model_height) rz_h = model_height & ~3;
+    if (rz_w < 4) rz_w = 4;
+    if (rz_h < 4) rz_h = 4;
+
+    int lb_pad_left = ((model_width - rz_w) / 2) & ~3;
+    int lb_pad_top = ((model_height - rz_h) / 2) & ~3;
+    if (lb_pad_left < 0) lb_pad_left = 0;
+    if (lb_pad_top < 0) lb_pad_top = 0;
+    if (lb_pad_left + rz_w > model_width) rz_w = model_width - lb_pad_left;
+    if (lb_pad_top + rz_h > model_height) rz_h = model_height - lb_pad_top;
+
+    cv::Mat src(bgr_h, bgr_w, CV_8UC3, const_cast<uint8_t*>(bgr), stride);
+    cv::Mat resized, rgb;
+    cv::resize(src, resized, cv::Size(rz_w, rz_h));
+    cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+
+    uint8_t* dst = static_cast<uint8_t*>(input_mem_->virt_addr);
+    const int dst_stride = model_width * 3;
+
+    // CPU 写 RKNN 输入 dmabuf 后要刷 cache，否则 NPU 可能读到旧数据
+    dma_buf_sync sync_start{};
+    sync_start.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE;
+    if (input_mem_->fd >= 0)
+        ioctl(input_mem_->fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+
+    memset(dst, 114, (size_t)model_width * model_height * 3);
+    for (int r = 0; r < rz_h; ++r) {
+        memcpy(dst + (size_t)(lb_pad_top + r) * dst_stride + (size_t)lb_pad_left * 3,
+               rgb.ptr(r), (size_t)rz_w * 3);
+    }
+
+    dma_buf_sync sync_end{};
+    sync_end.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE;
+    if (input_mem_->fd >= 0)
+        ioctl(input_mem_->fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+
+    int ret = 0;
+    {
+        PERF_SCOPE("NPU_inference");
+        ret = rknn_run(context, NULL);
+        if (ret != RKNN_SUCC)
+        {
+            printf("[yolo] rknn_run failed, ret=%d\n", ret);
+            return ret;
+        }
+    }
+    return decode_outputs(lb_scale, lb_scale, lb_pad_left, lb_pad_top, result_group);
 }

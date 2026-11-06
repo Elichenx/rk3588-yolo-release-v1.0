@@ -375,6 +375,7 @@ int post_process(int8_t *output0, int8_t *output1, int8_t *output2,
         }
 
         int id          = classID[n];
+        const char *label_temp = (id >= 0 && id < (int)labels.size()) ? labels[id].c_str() : "unknown";
 
         // 1. 限制在模型输入分辨率范围内
         xmin = clamp(xmin, 0, model_width);
@@ -389,7 +390,6 @@ int post_process(int8_t *output0, int8_t *output1, int8_t *output2,
         result_group.result[count].box.ymax = (int)((ymax - pad_top) / scale_h);
         result_group.result[count].box_conf = box_conf;
 
-        const char *label_temp = labels[id].c_str();
         // 将类别名称复制到检测结果组中（保证 null 终止，防止 UB）
         strncpy(result_group.result[count].label, label_temp, 32);
         result_group.result[count].label[31] = '\0';

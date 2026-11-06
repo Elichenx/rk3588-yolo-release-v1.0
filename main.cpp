@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <csignal>
+#include <cctype>
+#include <cstdio>
+#include <filesystem>
 #include <iomanip>
 #include <sstream>
 #include <fstream>
@@ -68,8 +71,8 @@ constexpr size_t READ_QUEUE_CAP  = 4;
 constexpr size_t WRITE_QUEUE_CAP = 4;
 // 默认处理帧数
 constexpr int DEFAULT_FRAME_LIMIT = 1500;
-// YOLO线程池 worker 数
-constexpr int PROCESS_THREAD_NUM = 3;
+// YOLO线程池 worker 数。RK3576 NPU 是双核，见 watchdog.h 的 kNpuCoreNum。
+constexpr int PROCESS_THREAD_NUM = kNpuCoreNum;
 
 // 解析命令行：--no-rtmp
 bool parseEnableRtmp(int argc, char* argv[]) {
@@ -98,6 +101,154 @@ bool parseBenchRga(int argc, char* argv[]) {
     }
     return false;
 }
+
+// 取 --key value。没有则返回空串。
+std::string parseOpt(int argc, char* argv[], const char* key) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], key) == 0) {
+            return argv[i + 1];
+        }
+    }
+    return {};
+}
+
+// SIGINT 优雅退出标志。数据集模式和摄像头模式都看它，所以要放在两个函数前面。
+std::atomic<bool> g_quit_requested{false};
+
+bool isImageFile(const std::filesystem::path& p) {
+    std::string ext = p.extension().string();
+    for (char& c : ext) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".bmp" || ext == ".webp";
+}
+
+// 无摄像头时的数据集测试：递归读图，OpenCV letterbox 后送 NPU，画框写到 out_dir。
+int runDatasetMode(const std::string& dataset_dir, const std::string& out_dir, const std::string& model_path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::is_directory(dataset_dir, ec)) {
+        std::cerr << "[Dataset] 目录不存在: " << dataset_dir << std::endl;
+        return -1;
+    }
+
+    fs::create_directories(out_dir, ec);
+    const fs::path out_abs = fs::weakly_canonical(fs::absolute(out_dir), ec);
+
+    std::vector<fs::path> images;
+    for (fs::recursive_directory_iterator it(dataset_dir, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec)) {
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        if (!it->is_regular_file(ec)) {
+            continue;
+        }
+        const fs::path file_abs = fs::weakly_canonical(it->path(), ec);
+        if (!out_abs.empty() && file_abs.string().rfind(out_abs.string(), 0) == 0) {
+            continue;
+        }
+        if (isImageFile(it->path())) {
+            images.push_back(it->path());
+        }
+    }
+    std::sort(images.begin(), images.end());
+    if (images.empty()) {
+        std::cerr << "[Dataset] 没有 jpg/png/bmp: " << dataset_dir << std::endl;
+        return -1;
+    }
+
+    std::cout << "[Dataset] RK3576 npu_cores=" << kNpuCoreNum
+              << " images=" << images.size()
+              << " model=" << model_path
+              << " out=" << out_dir << std::endl;
+    std::cout << "[Dataset] 当前是官方 COCO YOLOv5s：80 类，标签 model/coco_80_labels_list.txt。"
+                 "rknn 必须是 target_platform=rk3576 转出来的 yolov5s，不要用安全帽 best.rknn。"
+              << std::endl;
+
+    // 宽高只给摄像头 letterbox 用。数据集每张图在 inference_bgr 里单独算。
+    ThreadPoll pool(model_path.c_str(), kNpuCoreNum, 640, 640);
+
+    int saved = 0;
+    int boxes = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    constexpr size_t kBatch = 2;
+
+    for (size_t i = 0; i < images.size() && !g_quit_requested; ) {
+        const size_t n = std::min(kBatch, images.size() - i);
+        std::vector<cv::Mat> batch_imgs;
+        std::vector<fs::path> batch_paths;
+        std::vector<std::future<ProcessResult>> futs;
+        batch_imgs.reserve(n);
+
+        for (size_t j = 0; j < n; ++j) {
+            cv::Mat img = cv::imread(images[i + j].string(), cv::IMREAD_COLOR);
+            if (img.empty()) {
+                std::cerr << "[Dataset] 读取失败: " << images[i + j] << std::endl;
+                continue;
+            }
+            batch_paths.push_back(images[i + j]);
+            futs.push_back(pool.submit_bgr_async(static_cast<int>(i + j), img));
+            batch_imgs.push_back(std::move(img));
+        }
+
+        for (size_t j = 0; j < futs.size(); ++j) {
+            ProcessResult result = futs[j].get();
+            cv::Mat& img = batch_imgs[j];
+            if (!result.success) {
+                std::cerr << "[Dataset] 推理失败 " << batch_paths[j].filename().string()
+                          << " " << result.error_msg << std::endl;
+                continue;
+            }
+
+            const detect_result_group_t& group = result.detection_results;
+            for (int b = 0; b < group.box_count; ++b) {
+                const detect_result_t& det = group.result[b];
+                cv::rectangle(img,
+                              cv::Point(det.box.xmin, det.box.ymin),
+                              cv::Point(det.box.xmax, det.box.ymax),
+                              cv::Scalar(0, 0, 255), 2);
+                char text[96];
+                std::snprintf(text, sizeof(text), "%s %.0f%%",
+                              det.label, det.box_conf * 100.f);
+                cv::putText(img, text,
+                            cv::Point(det.box.xmin, std::max(16, det.box.ymin - 4)),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+                std::cout << "  " << batch_paths[j].filename().string()
+                          << " " << det.label << " " << det.box_conf
+                          << " [" << det.box.xmin << "," << det.box.ymin
+                          << "," << det.box.xmax << "," << det.box.ymax << "]\n";
+            }
+            boxes += group.box_count;
+
+            fs::path rel = fs::relative(batch_paths[j], dataset_dir, ec);
+            if (ec || rel.empty()) {
+                rel = batch_paths[j].filename();
+                ec.clear();
+            }
+            fs::path dst = fs::path(out_dir) / rel;
+            dst.replace_extension(".jpg");
+            fs::create_directories(dst.parent_path(), ec);
+            if (!cv::imwrite(dst.string(), img)) {
+                std::cerr << "[Dataset] 保存失败: " << dst << std::endl;
+                continue;
+            }
+            ++saved;
+            std::cout << "[Dataset] " << batch_paths[j].filename().string()
+                      << " boxes=" << group.box_count
+                      << " -> " << dst.string() << std::endl;
+        }
+        i += n;
+    }
+
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::cout << "[Dataset] done saved=" << saved
+              << " boxes=" << boxes
+              << " time=" << sec << "s" << std::endl;
+    return saved > 0 ? 0 : -1;
+}
+
 // ------------------------ 阶段间数据结构 ------------------------
 // capture 线程输出：携带原始 FramePacket + 捕获时刻
 struct CapturedFrame {
@@ -142,9 +293,6 @@ std::atomic<bool> g_writeFinish(false);  // 写线程完成后通知报警引擎
 
 // 报警引擎队列（容量16，溢出时自动丢弃最老事件）
 SafeQueue<AlarmEvent> g_alarmQueue(16);
-
-// SIGINT 优雅退出标志
-std::atomic<bool> g_quit_requested{false};
 
 
 // ------------------------ 线程1：采集 ------------------------
@@ -626,10 +774,21 @@ int main(int argc, char* argv[]) {
     const bool enable_rtmp = parseEnableRtmp(argc, argv);
     const bool enable_local_save = parseEnableLocalSave(argc, argv);
     const int frame_limit = DEFAULT_FRAME_LIMIT;
+    const std::string dataset_dir = parseOpt(argc, argv, "--dataset");
+    const std::string dataset_out = parseOpt(argc, argv, "--out");
+    const std::string model_override = parseOpt(argc, argv, "--model");
 
-    std::cout << "[Config] frames=" << frame_limit
+    std::cout << "[Config] RK3576 npu_cores=" << kNpuCoreNum
+              << " frames=" << frame_limit
               << " rtmp=" << (enable_rtmp ? "on" : "off")
               << " save=" << (enable_local_save ? "on" : "off") << std::endl;
+
+    // 没有摄像头时直接跑图片目录，不打开 V4L2 / MPP / RTSP
+    if (!dataset_dir.empty()) {
+        const std::string model_path = model_override.empty() ? kModelPath : model_override;
+        const std::string out_dir = dataset_out.empty() ? "dataset_out" : dataset_out;
+        return runDatasetMode(dataset_dir, out_dir, model_path);
+    }
 
     // 经过深度排查，cmdline 的 cma=128M 会破坏设备树(DTB)的 CMA 节点，导致 /dev/dma_heap/cma 丢失。
     // 2) 初始化相机（V4L2 + MMAP Export）并启动采集
@@ -719,7 +878,7 @@ int main(int argc, char* argv[]) {
     }
     
     //  初始化 YOLO 线程池 (传入相机分辨率用于动态计算 Letterbox)
-    ThreadPoll npu_pool("../model/best.rknn", PROCESS_THREAD_NUM, width, height);
+    ThreadPoll npu_pool(kModelPath, PROCESS_THREAD_NUM, width, height);
 
     // ── 初始化看门狗全局上下文（必须在启动线程前完成） ────────────────────────
     g_npu_pool_ptr = &npu_pool;       // 处理线程通过 g_npu_pool_ptr 间接访问
@@ -734,7 +893,7 @@ int main(int argc, char* argv[]) {
     std::thread t_proc(processThreadFunc);           // 通过 g_npu_pool_ptr 访问 NPU
     std::thread t_write(writeThreadFunc, writer.get());
     std::thread t_alarm(alarmEngineThreadFunc);       // 报警引擎：独立线程，接管防抖/冷却/推送
-    std::thread t_watchdog(watchdogThreadFunc, std::ref(g_camera)); // 看门狗：监控摄像头/NPU
+    std::thread t_watchdog(watchdogThreadFunc, std::ref(g_camera)); // 看门狗：监控摄像头/NPU、
 
     //  等待线程收敛并停止队列（流水线顺序退出）
     t_cap.join();

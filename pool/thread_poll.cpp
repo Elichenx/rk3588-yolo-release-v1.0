@@ -30,7 +30,8 @@ void ThreadPoll::init(const char* model_path, int num_threads, int img_w, int im
     if(num_threads <= 0) num_threads = 1; // 保底
     for(int i = 0; i < num_threads; i++)
     {
-        auto yolo = std::make_shared<Yolov5s>(model_path, i % 3, img_w, img_h);
+        // RK3576 只有 Core0 / Core1，多出来的线程在两个核上轮转
+        auto yolo = std::make_shared<Yolov5s>(model_path, i % 2, img_w, img_h);
         yolo_group.emplace_back(yolo);
     }
 
@@ -90,6 +91,45 @@ std::future<ProcessResult> ThreadPoll::submit_task_async(int index, int dmabuf_f
             int ret = yolo->inference_image(dmabuf_fd, detections);
             if (ret != 0) {
                 result.error_msg = "inference_image failed, ret=" + std::to_string(ret);
+                result.success = false;
+            } else {
+                result.detection_results = detections;
+                result.success = true;
+            }
+        }
+        catch(const std::exception& e)
+        {
+            result.error_msg = e.what();
+            result.success = false;
+        }
+        return result;
+    });
+
+    std::future<ProcessResult> future = task.get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        tasks.emplace(std::move(task));
+    }
+    condition.notify_one();
+    return future;
+}
+
+std::future<ProcessResult> ThreadPoll::submit_bgr_async(int index, const cv::Mat& bgr)
+{
+    // 异步任务持有独立副本，调用方可以立刻复用原图
+    cv::Mat image = bgr.clone();
+    std::packaged_task<ProcessResult(std::shared_ptr<Yolov5s>)> task(
+        [index, image](std::shared_ptr<Yolov5s> yolo) mutable
+    {
+        (void)index;
+        ProcessResult result;
+        try
+        {
+            detect_result_group_t detections;
+            int ret = yolo->inference_bgr(image.data, image.cols, image.rows,
+                                          static_cast<int>(image.step), detections);
+            if (ret != 0) {
+                result.error_msg = "inference_bgr failed, ret=" + std::to_string(ret);
                 result.success = false;
             } else {
                 result.detection_results = detections;

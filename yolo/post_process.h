@@ -6,12 +6,14 @@
 #include <vector>
 
 #define OBJ_NUM_MAX_SIZE        64
-#define OBJ_CLASS_NUM 5
-#define LABLE_PATH "../model/helmet_labels.txt"
+// 临时切换：官方 COCO YOLOv5s，80 类。安全帽 5 类见 model/helmet_labels.txt。
+#define OBJ_CLASS_NUM 80
+#define LABLE_PATH "../model/coco_80_labels_list.txt"
 #define BOX_NUM_SIZE (OBJ_CLASS_NUM+5)
 #define MAX_OBJ_BOXS 60
 
-#define BOX_THRESHOLD 0.65
+// 官方 YOLOv5 默认置信度是 0.25。原来的 0.65 是安全帽模型用的，COCO 上会漏掉大部分框。
+#define BOX_THRESHOLD 0.25
 #define NMS_THRESHOLD 0.45
 
 

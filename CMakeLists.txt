@@ -37,33 +37,44 @@ find_library(MPP_LIBRARY NAMES rockchip_mpp mpp REQUIRED)
 message(STATUS "find MPP library: ${MPP_LIBRARY}")
 
 # ------------------------- 芯片 / 第三方路径 -------------------------
+# 目标板是 RK3576。im2d 头文件和 RK3588 是同一套，仓库里没有单独的 RK3576 目录，
+# DEVICE_NAME 只决定头文件回退路径。运行库必须用板子系统里的 librknnrt.so / librga.so，
+# 旧的 RK3588 运行库认不出 target=rk3576 的模型。
 set(LIB_ARCH "aarch64")
 set(DEVICE_NAME "RK3588")
 set(THIRDPARTY_PATH "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
 
-# RKNN — 优先查找系统安装的，找不到再 fallback 到 3rdparty
+# RKNN — 先找板子系统库，再回退到 3rdparty
 set(RKNN_API_PATH "${THIRDPARTY_PATH}/librknn_api")
 set(RKNN_INCLUDE_DIRS "${RKNN_API_PATH}/include")
-find_library(RKNN_LIBS NAMES rknnrt
-    PATHS "${RKNN_API_PATH}/${LIB_ARCH}"
-    NO_DEFAULT_PATH
-)
+find_library(RKNN_LIBS NAMES rknnrt)
+if(NOT RKNN_LIBS)
+    find_library(RKNN_LIBS NAMES rknnrt
+        PATHS "${RKNN_API_PATH}/${LIB_ARCH}"
+        NO_DEFAULT_PATH
+    )
+endif()
 if(NOT RKNN_LIBS)
     message(FATAL_ERROR "librknnrt.so not found! \
-        Place it at 3rdparty/librknn_api/aarch64/ or install system-wide.")
+        Install the board runtime (usually /usr/lib/librknnrt.so) \
+        or place it at 3rdparty/librknn_api/aarch64/.")
 endif()
 message(STATUS "find RKNN library: ${RKNN_LIBS}")
 
-# RGA — 优先查找系统安装的，找不到再 fallback 到 3rdparty
+# RGA — 先找板子系统库。RK3576 用系统 librga.so，不要链 RK3588 的静态库。
 set(RGA_PATH "${THIRDPARTY_PATH}/rga/${DEVICE_NAME}")
 set(RGA_INCLUDE_DIRS "${RGA_PATH}/include")
-find_library(RGA_LIBS NAMES rga
-    PATHS "${RGA_PATH}/lib/Linux/${LIB_ARCH}"
-    NO_DEFAULT_PATH
-)
+find_library(RGA_LIBS NAMES rga)
+if(NOT RGA_LIBS)
+    find_library(RGA_LIBS NAMES rga
+        PATHS "${RGA_PATH}/lib/Linux/${LIB_ARCH}"
+        NO_DEFAULT_PATH
+    )
+endif()
 if(NOT RGA_LIBS)
     message(FATAL_ERROR "librga.so not found! \
-        Place it at 3rdparty/rga/RK3588/lib/Linux/aarch64/ or install system-wide.")
+        Install the board runtime (usually /usr/lib/librga.so) \
+        or place it at 3rdparty/rga/RK3588/lib/Linux/aarch64/.")
 endif()
 message(STATUS "find RGA library: ${RGA_LIBS}")
 
